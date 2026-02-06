@@ -49,6 +49,8 @@ class DiagnosticsWidget(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.thread_pool = QThreadPool.globalInstance()
+        self._socks_port = 1080
+        self._http_port = 8080
 
         self.hint_label = QLabel("")
         self.hint_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -85,6 +87,10 @@ class DiagnosticsWidget(QWidget):
     def set_hint(self, text: str) -> None:
         self.hint_label.setText(text)
 
+    def set_proxy_ports(self, *, socks_port: int, http_port: int) -> None:
+        self._socks_port = socks_port
+        self._http_port = http_port
+
     def refresh(self) -> None:
         self.set_hint("")
         self.text_area.setPlainText("Refreshing diagnostics...")
@@ -114,7 +120,9 @@ class DiagnosticsWidget(QWidget):
         self.set_hint(f"Opened logs folder: {logs_dir}")
 
     def copy_manual_proxy(self) -> None:
-        # Placeholder until ports are dynamic.
-        text = "SOCKS5 Proxy: 127.0.0.1:1080\nHTTP Proxy: 127.0.0.1:8080"
+        text = (
+            f"SOCKS5 Proxy: 127.0.0.1:{self._socks_port}\n"
+            f"HTTP Proxy: 127.0.0.1:{self._http_port}"
+        )
         QApplication.clipboard().setText(text)
         self.set_hint("Manual proxy settings copied.")

@@ -2,4 +2,16 @@
 set -euo pipefail
 
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)/src"
-python -m v2link_client.main
+
+if [[ -x ".venv/bin/python" ]]; then
+  PYTHON_BIN=".venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="python"
+else
+  echo "Error: No python interpreter found (tried .venv/bin/python, python3, python)" >&2
+  exit 1
+fi
+
+"${PYTHON_BIN}" -m v2link_client.main
