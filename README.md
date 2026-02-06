@@ -20,3 +20,4 @@ Linux desktop client for V2Ray-style links built with Python 3.11+ and PyQt6 (cu
   - Paste a `vless://` link
   - Click `Validate & Save`
   - Click `Start` (defaults to SOCKS5 `127.0.0.1:1080`, HTTP `127.0.0.1:8080`, but will pick free ports if busy)
+  - Watch `Connectivity:` for ONLINE/OFFLINE (checks through the local HTTP proxy)
