@@ -36,6 +36,8 @@ def test_build_xray_config_for_vless_tls(tmp_path) -> None:
     assert stream["tlsSettings"]["serverName"] == "aka.ms"
     assert stream["tlsSettings"]["allowInsecure"] is False
     assert stream["tlsSettings"]["fingerprint"] == "chrome"
+    assert stream["tlsSettings"]["verifyPeerCertInNames"] == ["aka.ms", "prime.example.com"]
+    assert stream["tlsSettings"]["verifyPeerCertByName"] == "aka.ms,prime.example.com"
 
 
 def test_build_xray_config_rejects_grpc_without_service_name(tmp_path) -> None:
@@ -57,4 +59,3 @@ def test_build_xray_config_supports_ws(tmp_path) -> None:
     assert stream["network"] == "ws"
     assert stream["wsSettings"]["path"] == "/websocket"
     assert stream["wsSettings"]["headers"]["Host"] == "cdn.example.com"
-

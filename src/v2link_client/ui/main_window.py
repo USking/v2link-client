@@ -352,8 +352,8 @@ class MainWindow(QMainWindow):
         sni = getattr(link, "sni", None)
         if sni and host and sni != host:
             return (
-                "TLS SNI differs from host. With allowInsecure=0 the certificate must match SNI. "
-                "If connectivity fails, try removing `sni` or setting it to the host."
+                "TLS SNI differs from host. Some servers present a certificate for the host even when SNI differs. "
+                "If connectivity fails, check logs and try setting `sni` to the host (or set allowInsecure=1 if you understand the risk)."
             )
         return None
 

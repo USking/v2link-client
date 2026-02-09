@@ -136,6 +136,31 @@ def _build_xray_stream_settings(link: VlessLink) -> dict[str, Any]:
             "allowInsecure": link.allow_insecure,
             "serverName": link.sni or link.host,
         }
+        # Some share-links set `sni=...` to a value that differs from the
+        # dial target (link.host). In practice, many servers still present a
+        # certificate for the dial target, which would fail strict hostname
+        # verification when `serverName` is set to the SNI value.
+        #
+        # Xray supports overriding the hostname verification list while still
+        # sending the desired SNI via:
+        # - `verifyPeerCertInNames` (older)
+        # - `verifyPeerCertByName` (newer, comma-separated)
+        #
+        # We set both for compatibility; unknown fields are ignored by Xray.
+        if (
+            not link.allow_insecure
+            and link.sni
+            and link.host
+            and link.sni.strip()
+            and link.sni.strip() != link.host.strip()
+        ):
+            verify_names: list[str] = []
+            for name in (link.sni.strip(), link.host.strip()):
+                if name and name not in verify_names:
+                    verify_names.append(name)
+            if verify_names:
+                tls_settings["verifyPeerCertInNames"] = verify_names
+                tls_settings["verifyPeerCertByName"] = ",".join(verify_names)
         if link.fingerprint:
             tls_settings["fingerprint"] = link.fingerprint
         if link.alpn:
