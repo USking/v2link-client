@@ -7,6 +7,8 @@ Current status: **early beta** — the app currently supports **`vless://`** lin
 ## Features
 
 - Paste a `vless://` link → validate → start/stop the core
+- Ping server (TCP/TLS) + built-in speed test (through the tunnel)
+- Live session metrics: uptime, upload/download speed, total traffic used
 - Local proxy inbounds:
   - SOCKS5 on `127.0.0.1:<port>`
   - HTTP proxy on `127.0.0.1:<port>`

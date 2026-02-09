@@ -16,6 +16,7 @@ from v2link_client.core.storage import get_logs_dir
 DEFAULT_LISTEN = "127.0.0.1"
 DEFAULT_SOCKS_PORT = 1080
 DEFAULT_HTTP_PORT = 8080
+DEFAULT_API_PORT = 10085
 
 
 def build_xray_config(
@@ -24,6 +25,7 @@ def build_xray_config(
     listen: str = DEFAULT_LISTEN,
     socks_port: int = DEFAULT_SOCKS_PORT,
     http_port: int = DEFAULT_HTTP_PORT,
+    api_port: int | None = None,
     logs_dir: Path | None = None,
 ) -> dict[str, Any]:
     if not isinstance(link, VlessLink):
@@ -33,6 +35,7 @@ def build_xray_config(
         )
 
     logs_dir = logs_dir or get_logs_dir()
+    logs_dir.mkdir(parents=True, exist_ok=True)
 
     outbound: dict[str, Any] = {
         "tag": "proxy",
@@ -57,36 +60,65 @@ def build_xray_config(
 
     sniffing = {"enabled": True, "destOverride": ["http", "tls", "quic"]}
 
+    inbounds: list[dict[str, Any]] = [
+        {
+            "tag": "socks-in",
+            "listen": listen,
+            "port": socks_port,
+            "protocol": "socks",
+            "settings": {"auth": "noauth", "udp": True},
+            "sniffing": sniffing,
+        },
+        {
+            "tag": "http-in",
+            "listen": listen,
+            "port": http_port,
+            "protocol": "http",
+            "settings": {},
+            "sniffing": sniffing,
+        },
+    ]
+
     config: dict[str, Any] = {
         "log": {
             "loglevel": "warning",
             "access": str(logs_dir / "xray_access.log"),
             "error": str(logs_dir / "xray_error.log"),
         },
-        "inbounds": [
-            {
-                "tag": "socks-in",
-                "listen": listen,
-                "port": socks_port,
-                "protocol": "socks",
-                "settings": {"auth": "noauth", "udp": True},
-                "sniffing": sniffing,
-            },
-            {
-                "tag": "http-in",
-                "listen": listen,
-                "port": http_port,
-                "protocol": "http",
-                "settings": {},
-                "sniffing": sniffing,
-            },
-        ],
+        "inbounds": inbounds,
         "outbounds": [
             outbound,
             {"tag": "direct", "protocol": "freedom", "settings": {}},
             {"tag": "block", "protocol": "blackhole", "settings": {}},
         ],
     }
+
+    if api_port is not None:
+        # Enable Xray stats + local API so the UI can show traffic usage.
+        # API is bound to localhost only.
+        config["stats"] = {}
+        config["api"] = {"tag": "api", "services": ["StatsService"]}
+        # Route API inbound to the internal API service (outbound tag = api.tag).
+        config["routing"] = {
+            "rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]
+        }
+        config["policy"] = {
+            "system": {
+                "statsInboundUplink": True,
+                "statsInboundDownlink": True,
+                "statsOutboundUplink": True,
+                "statsOutboundDownlink": True,
+            }
+        }
+        inbounds.append(
+            {
+                "tag": "api",
+                "listen": listen,
+                "port": api_port,
+                "protocol": "dokodemo-door",
+                "settings": {"address": "127.0.0.1"},
+            }
+        )
 
     return config
 

@@ -59,3 +59,22 @@ def test_build_xray_config_supports_ws(tmp_path) -> None:
     assert stream["network"] == "ws"
     assert stream["wsSettings"]["path"] == "/websocket"
     assert stream["wsSettings"]["headers"]["Host"] == "cdn.example.com"
+
+
+def test_build_xray_config_includes_stats_api_when_api_port_set(tmp_path) -> None:
+    parsed = parse_link(
+        "vless://b345f204-4df1-4d31-8243-dae7845099ad@prime.example.com:443"
+        "?security=tls&allowInsecure=0&encryption=none&type=tcp&sni=aka.ms&fp=chrome"
+    )
+    cfg = build_xray_config(parsed, logs_dir=tmp_path, api_port=12345)
+
+    assert cfg["api"]["tag"] == "api"
+    assert "StatsService" in cfg["api"]["services"]
+    assert cfg["routing"]["rules"][0]["inboundTag"] == ["api"]
+    assert cfg["routing"]["rules"][0]["outboundTag"] == "api"
+    assert cfg["policy"]["system"]["statsOutboundUplink"] is True
+    assert cfg["policy"]["system"]["statsOutboundDownlink"] is True
+
+    api_inbound = next(i for i in cfg["inbounds"] if i["tag"] == "api")
+    assert api_inbound["listen"] == DEFAULT_LISTEN
+    assert api_inbound["port"] == 12345

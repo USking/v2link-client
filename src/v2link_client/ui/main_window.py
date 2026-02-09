@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from PyQt6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -18,6 +19,7 @@ from PyQt6.QtWidgets import (
 )
 
 from v2link_client.core.config_builder import (
+    DEFAULT_API_PORT,
     DEFAULT_HTTP_PORT,
     DEFAULT_LISTEN,
     DEFAULT_SOCKS_PORT,
@@ -25,7 +27,9 @@ from v2link_client.core.config_builder import (
 )
 from v2link_client.core.errors import AppError
 from v2link_client.core.health_check import ProxyHealthResult, check_http_proxy
+from v2link_client.core.humanize import format_bytes, format_duration_s, format_mbps
 from v2link_client.core.link_parser import parse_link
+from v2link_client.core.net_probe import ServerPingResult, ping_server
 from v2link_client.core.process_manager import (
     XrayProcessManager,
     ensure_port_available,
@@ -33,7 +37,9 @@ from v2link_client.core.process_manager import (
     find_xray_binary,
     validate_xray_config,
 )
+from v2link_client.core.speed_test import SpeedTestResult, run_speed_test_via_http_proxy
 from v2link_client.core.storage import get_config_dir, get_state_dir, load_json, save_json
+from v2link_client.core.xray_api import TrafficStats, get_outbound_traffic
 from v2link_client.ui.diagnostics_widget import DiagnosticsWidget
 from v2link_client.ui.theme import ThemeName, apply_theme, normalize_theme, theme_display_name
 
@@ -89,6 +95,16 @@ class MainWindow(QMainWindow):
         self.start_stop_button.clicked.connect(self._on_start_stop_clicked)
         self.start_stop_button.setProperty("variant", "primary")
 
+        self.ping_button = QPushButton("Ping Server")
+        self.ping_button.setEnabled(False)
+        self.ping_button.clicked.connect(self._on_ping_clicked)
+        self.ping_button.setProperty("variant", "ghost")
+
+        self.speed_test_button = QPushButton("Speed Test")
+        self.speed_test_button.setEnabled(False)
+        self.speed_test_button.clicked.connect(self._on_speed_test_clicked)
+        self.speed_test_button.setProperty("variant", "ghost")
+
         self.status_label = QLabel("STOPPED")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.status_label.setProperty("role", "pill")
@@ -112,10 +128,30 @@ class MainWindow(QMainWindow):
         control_row = QHBoxLayout()
         control_row.setSpacing(10)
         control_row.addWidget(self.start_stop_button)
+        control_row.addWidget(self.ping_button)
+        control_row.addWidget(self.speed_test_button)
         control_row.addWidget(QLabel("Status:"))
         control_row.addWidget(self.status_label, 1)
         control_row.addWidget(QLabel("Connectivity:"))
         control_row.addWidget(self.health_label)
+
+        self.uptime_label = QLabel("UPTIME (00:00:00)")
+        self.uptime_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.uptime_label.setProperty("role", "pill")
+
+        self.speed_label = QLabel("SPEED (↑ 0.0 Mbps / ↓ 0.0 Mbps)")
+        self.speed_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.speed_label.setProperty("role", "pill")
+
+        self.traffic_label = QLabel("TRAFFIC (↑ 0 B / ↓ 0 B)")
+        self.traffic_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.traffic_label.setProperty("role", "pill")
+
+        metrics_row = QHBoxLayout()
+        metrics_row.setSpacing(10)
+        metrics_row.addWidget(self.uptime_label)
+        metrics_row.addWidget(self.speed_label, 1)
+        metrics_row.addWidget(self.traffic_label)
 
         self.diagnostics_widget = DiagnosticsWidget()
 
@@ -124,6 +160,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
         layout.addLayout(top_row)
         layout.addLayout(control_row)
+        layout.addLayout(metrics_row)
         layout.addWidget(self.diagnostics_widget, 1)
 
         central.setLayout(layout)
@@ -133,6 +170,7 @@ class MainWindow(QMainWindow):
         self._validated_link = None
         self._socks_port = DEFAULT_SOCKS_PORT
         self._http_port = DEFAULT_HTTP_PORT
+        self._api_port: int | None = None
         self.diagnostics_widget.set_proxy_ports(
             socks_port=self._socks_port, http_port=self._http_port
         )
@@ -149,6 +187,15 @@ class MainWindow(QMainWindow):
         self._status_timer.setInterval(1000)
         self._status_timer.timeout.connect(self._poll_core_status)
 
+        self._core_started_at: float | None = None
+        self._stats_in_flight = False
+        self._stats_token = 0
+        self._last_stats_at: float | None = None
+        self._last_uplink: int | None = None
+        self._last_downlink: int | None = None
+        self._ping_in_flight = False
+        self._speed_test_in_flight = False
+
         self._load_profile()
         self._apply_theme(self._theme, persist=False)
         self.theme_selector.currentTextChanged.connect(self._on_theme_changed)
@@ -158,13 +205,22 @@ class MainWindow(QMainWindow):
         self._validated_config_path = None
         self._validated_link = None
         self.start_stop_button.setEnabled(False)
+        self.ping_button.setEnabled(False)
+        self.speed_test_button.setEnabled(False)
+        self._api_port = None
+        self._core_started_at = None
+        self._stats_token += 1
+        self._last_stats_at = None
+        self._last_uplink = None
+        self._last_downlink = None
+        self._set_metrics_defaults()
 
         raw_link = self.link_input.text()
         try:
             parsed_link = parse_link(raw_link)
-            socks_port, http_port = self._pick_proxy_ports()
+            socks_port, http_port, api_port = self._pick_proxy_ports()
             config = build_xray_config(
-                parsed_link, socks_port=socks_port, http_port=http_port
+                parsed_link, socks_port=socks_port, http_port=http_port, api_port=api_port
             )
             config_path = get_state_dir() / XRAY_CONFIG_FILE
             save_json(config_path, config)
@@ -192,10 +248,12 @@ class MainWindow(QMainWindow):
         self._validated_link = parsed_link
         self._socks_port = socks_port
         self._http_port = http_port
+        self._api_port = api_port
         self.diagnostics_widget.set_proxy_ports(
             socks_port=self._socks_port, http_port=self._http_port
         )
         self.start_stop_button.setEnabled(True)
+        self.ping_button.setEnabled(True)
         hint = (
             f"Validated: {parsed_link.display_name()}. "
             f"Ready to start (SOCKS5 {DEFAULT_LISTEN}:{self._socks_port}, HTTP {DEFAULT_LISTEN}:{self._http_port})."
@@ -218,6 +276,8 @@ class MainWindow(QMainWindow):
         try:
             ensure_port_available(DEFAULT_LISTEN, self._socks_port)
             ensure_port_available(DEFAULT_LISTEN, self._http_port)
+            if self._api_port is not None:
+                ensure_port_available(DEFAULT_LISTEN, int(self._api_port))
             self._process.start(self._validated_config_path)
         except AppError as exc:
             self.diagnostics_widget.set_hint(exc.user_message)
@@ -233,6 +293,13 @@ class MainWindow(QMainWindow):
         self._refresh_style(self.start_stop_button)
         self.link_input.setEnabled(False)
         self.validate_button.setEnabled(False)
+        self.ping_button.setEnabled(False)
+        self.speed_test_button.setEnabled(True)
+        self._core_started_at = time.monotonic()
+        self._stats_token += 1
+        self._last_stats_at = None
+        self._last_uplink = None
+        self._last_downlink = None
         self._health_token += 1
         self._last_health_ok = None
         self._set_health_state("connecting", "Checking…")
@@ -245,6 +312,8 @@ class MainWindow(QMainWindow):
 
     def _poll_core_status(self) -> None:
         if self._process.is_running():
+            self._update_uptime()
+            self._kick_stats_poll()
             return
 
         code = self._process.returncode()
@@ -255,9 +324,14 @@ class MainWindow(QMainWindow):
         self._refresh_style(self.start_stop_button)
         self.link_input.setEnabled(True)
         self.validate_button.setEnabled(True)
+        self.ping_button.setEnabled(True if self._validated_link is not None else False)
+        self.speed_test_button.setEnabled(False)
         self._health_timer.stop()
         self._health_token += 1
+        self._stats_token += 1
         self._set_health_state("offline", "Not running")
+        self._core_started_at = None
+        self._set_metrics_defaults()
 
         suffix = f" (exit code {code})" if code is not None else ""
         hint = f"Core stopped{suffix}. Check logs for details."
@@ -269,6 +343,7 @@ class MainWindow(QMainWindow):
         self._status_timer.stop()
         self._health_timer.stop()
         self._health_token += 1
+        self._stats_token += 1
         try:
             self._process.stop()
         except Exception:  # pragma: no cover - defensive
@@ -280,7 +355,11 @@ class MainWindow(QMainWindow):
         self._refresh_style(self.start_stop_button)
         self.link_input.setEnabled(True)
         self.validate_button.setEnabled(True)
+        self.ping_button.setEnabled(True if self._validated_link is not None else False)
+        self.speed_test_button.setEnabled(False)
         self._set_health_state("offline", "Not running")
+        self._core_started_at = None
+        self._set_metrics_defaults()
         self.diagnostics_widget.set_hint(user_message)
 
     def _load_profile(self) -> None:
@@ -323,9 +402,10 @@ class MainWindow(QMainWindow):
         style.polish(widget)
         widget.update()
 
-    def _pick_proxy_ports(self) -> tuple[int, int]:
+    def _pick_proxy_ports(self) -> tuple[int, int, int]:
         socks_port = DEFAULT_SOCKS_PORT
         http_port = DEFAULT_HTTP_PORT
+        api_port = DEFAULT_API_PORT
 
         try:
             ensure_port_available(DEFAULT_LISTEN, socks_port)
@@ -340,7 +420,174 @@ class MainWindow(QMainWindow):
         while http_port == socks_port:
             http_port = find_free_port(DEFAULT_LISTEN)
 
-        return socks_port, http_port
+        try:
+            ensure_port_available(DEFAULT_LISTEN, api_port)
+        except AppError:
+            api_port = find_free_port(DEFAULT_LISTEN)
+
+        while api_port in {socks_port, http_port}:
+            api_port = find_free_port(DEFAULT_LISTEN)
+
+        return socks_port, http_port, api_port
+
+    def _set_metrics_defaults(self) -> None:
+        self.uptime_label.setText("UPTIME (00:00:00)")
+        self.speed_label.setText("SPEED (↑ 0.0 Mbps / ↓ 0.0 Mbps)")
+        self.traffic_label.setText("TRAFFIC (↑ 0 B / ↓ 0 B)")
+
+    def _update_uptime(self) -> None:
+        if self._core_started_at is None:
+            self.uptime_label.setText("UPTIME (00:00:00)")
+            return
+        self.uptime_label.setText(
+            f"UPTIME ({format_duration_s(time.monotonic() - self._core_started_at)})"
+        )
+
+    def _kick_stats_poll(self) -> None:
+        if self._stats_in_flight:
+            return
+        if self._api_port is None:
+            return
+        if not self._process.is_running():
+            return
+
+        token = self._stats_token
+        api_server = f"{DEFAULT_LISTEN}:{self._api_port}"
+        xray_path = self._process.binary.path
+        self._stats_in_flight = True
+
+        def _run():
+            stats = get_outbound_traffic(xray_path, server=api_server)
+            return token, time.monotonic(), stats
+
+        worker = HealthCheckWorker(_run)
+        worker.signals.result.connect(self._on_stats_result)
+        worker.signals.error.connect(lambda msg: self._on_stats_error(token, msg))
+        self._thread_pool.start(worker)
+
+    def _on_stats_result(self, payload: object) -> None:
+        self._stats_in_flight = False
+        token, now, stats = payload  # type: ignore[misc]
+        if token != self._stats_token:
+            return
+        if not isinstance(stats, TrafficStats):  # pragma: no cover - defensive
+            return
+
+        self.traffic_label.setText(
+            f"TRAFFIC (↑ {format_bytes(stats.uplink_bytes)} / ↓ {format_bytes(stats.downlink_bytes)})"
+        )
+
+        # Speed = delta bytes / delta time.
+        if self._last_stats_at is not None and self._last_uplink is not None and self._last_downlink is not None:
+            dt = max(0.001, float(now) - float(self._last_stats_at))
+            up_bps = (stats.uplink_bytes - self._last_uplink) / dt
+            down_bps = (stats.downlink_bytes - self._last_downlink) / dt
+            self.speed_label.setText(
+                f"SPEED (↑ {format_mbps(up_bps)} / ↓ {format_mbps(down_bps)})"
+            )
+
+        self._last_stats_at = float(now)
+        self._last_uplink = int(stats.uplink_bytes)
+        self._last_downlink = int(stats.downlink_bytes)
+
+    def _on_stats_error(self, token: int, message: str) -> None:
+        self._stats_in_flight = False
+        if token != self._stats_token:
+            return
+        # Keep the UI stable; stats may be unavailable if API isn't ready yet.
+        logger.info("Stats poll failed: %s", message)
+
+    def _on_ping_clicked(self) -> None:
+        if self._ping_in_flight:
+            return
+        if self._validated_link is None:
+            self.diagnostics_widget.set_hint("Validate & Save a link first.")
+            return
+
+        link = self._validated_link
+        self._ping_in_flight = True
+        self.ping_button.setEnabled(False)
+        self.diagnostics_widget.set_hint(f"Pinging {link.host}:{link.port} ...")
+
+        def _run():
+            return ping_server(
+                link.host,
+                link.port,
+                security=link.security,
+                sni=link.sni,
+                allow_insecure=link.allow_insecure,
+                timeout_s=4.0,
+            )
+
+        worker = HealthCheckWorker(_run)
+        worker.signals.result.connect(self._on_ping_result)
+        worker.signals.error.connect(self._on_ping_error)
+        self._thread_pool.start(worker)
+
+    def _on_ping_result(self, payload: object) -> None:
+        self._ping_in_flight = False
+        self.ping_button.setEnabled(True)
+        if not isinstance(payload, ServerPingResult):  # pragma: no cover - defensive
+            self.diagnostics_widget.set_hint("Ping failed: invalid result.")
+            return
+
+        parts: list[str] = []
+        if payload.tcp_ms is not None:
+            parts.append(f"TCP {payload.tcp_ms} ms")
+        if payload.tls_sni_ms is not None:
+            parts.append(f"TLS(SNI) {payload.tls_sni_ms} ms")
+        if payload.tls_host_ms is not None:
+            parts.append(f"TLS(host) {payload.tls_host_ms} ms")
+        summary = ", ".join(parts) if parts else "No timing data"
+        if payload.error:
+            summary = f"{summary}. {payload.error}"
+        self.diagnostics_widget.set_hint(f"Ping: {summary}")
+
+    def _on_ping_error(self, message: str) -> None:
+        self._ping_in_flight = False
+        self.ping_button.setEnabled(True)
+        self.diagnostics_widget.set_hint(f"Ping failed: {message}")
+
+    def _on_speed_test_clicked(self) -> None:
+        if self._speed_test_in_flight:
+            return
+        if not self._process.is_running():
+            self.diagnostics_widget.set_hint("Start the core first.")
+            return
+
+        self._speed_test_in_flight = True
+        self.speed_test_button.setEnabled(False)
+        self.diagnostics_widget.set_hint("Running speed test (download + upload) ...")
+
+        http_port = self._http_port
+
+        def _run():
+            return run_speed_test_via_http_proxy(DEFAULT_LISTEN, http_port)
+
+        worker = HealthCheckWorker(_run)
+        worker.signals.result.connect(self._on_speed_test_result)
+        worker.signals.error.connect(self._on_speed_test_error)
+        self._thread_pool.start(worker)
+
+    def _on_speed_test_result(self, payload: object) -> None:
+        self._speed_test_in_flight = False
+        self.speed_test_button.setEnabled(True)
+        if not isinstance(payload, SpeedTestResult):  # pragma: no cover - defensive
+            self.diagnostics_widget.set_hint("Speed test failed: invalid result.")
+            return
+
+        if payload.error:
+            self.diagnostics_widget.set_hint(f"Speed test failed: {payload.error}")
+            return
+
+        down = format_mbps(payload.download_bps or 0.0)
+        up = format_mbps(payload.upload_bps or 0.0)
+        self.diagnostics_widget.set_hint(f"Speed test: ↓ {down} / ↑ {up}")
+
+    def _on_speed_test_error(self, message: str) -> None:
+        self._speed_test_in_flight = False
+        self.speed_test_button.setEnabled(True)
+        self.diagnostics_widget.set_hint(f"Speed test failed: {message}")
 
     def _validation_warning(self, link) -> str | None:
         if getattr(link, "security", None) != "tls":
