@@ -4,6 +4,16 @@ Linux desktop client for V2Ray-style links built with Python 3.11+ and PyQt6.
 
 Current status: **early beta** — the app currently supports **`vless://`** links (a useful subset) and runs **Xray-core** under the hood.
 
+## Screenshots
+
+<p>
+  <img src="images/app-dark.png" width="900" alt="v2link-client (Dark)" />
+</p>
+
+<p>
+  <img src="images/app-light.png" width="900" alt="v2link-client (Light)" />
+</p>
+
 ## Features
 
 - Paste a `vless://` link → validate → start/stop the core
@@ -14,6 +24,7 @@ Current status: **early beta** — the app currently supports **`vless://`** lin
   - HTTP proxy on `127.0.0.1:<port>`
 - Connectivity indicator: `CONNECTING` / `ONLINE` / `DEGRADED` / `OFFLINE`
 - Built-in diagnostics and log access
+- About dialog (Help -> About)
 - Light/Dark theme toggle (saved to your profile)
 
 ## Requirements (runtime)
@@ -59,12 +70,14 @@ pip install -r requirements.txt
 1) Paste your `vless://` link.
 2) Click **Validate & Save**.
 3) Click **Start**.
-4) Configure your browser/app to use the proxy:
+4) To proxy the whole system, enable **System Proxy** (recommended).  
+   If you prefer manual setup, configure your browser/app to use the proxy:
    - Click **Copy manual proxy settings** in the app and paste them where needed.
 
 Notes:
 - The app defaults to SOCKS5 `127.0.0.1:1080` and HTTP `127.0.0.1:8080`, but will pick free ports if those are busy.
 - The selected theme is saved in your profile and restored on next launch.
+- System proxy auto-apply currently targets GNOME/libproxy via `gsettings`. Other desktops may require manual proxy setup.
 
 ## Supported link subset (today)
 
@@ -76,7 +89,7 @@ Notes:
 
 Not supported yet:
 - `vmess://`, `trojan://`, `ss://`
-- REALITY, advanced XTLS options, complex routing rules, multiple profiles, system proxy auto-apply
+- REALITY, advanced XTLS options, complex routing rules, multiple profiles
 
 ## Logs & data locations
 
@@ -113,6 +126,10 @@ Run tests:
 ```bash
 PYTHONPATH=src python -m pytest -q
 ```
+
+## Author
+
+Udaya Sri
 
 ## License
 

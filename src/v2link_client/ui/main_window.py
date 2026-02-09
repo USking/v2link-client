@@ -6,18 +6,22 @@ import logging
 import time
 
 from PyQt6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
+from v2link_client import __author__, __version__
 from v2link_client.core.config_builder import (
     DEFAULT_API_PORT,
     DEFAULT_HTTP_PORT,
@@ -30,6 +34,7 @@ from v2link_client.core.health_check import ProxyHealthResult, check_http_proxy
 from v2link_client.core.humanize import format_bytes, format_duration_s, format_mbps
 from v2link_client.core.link_parser import parse_link
 from v2link_client.core.net_probe import ServerPingResult, ping_server
+from v2link_client.core.proxy_manager import SystemProxyConfig, SystemProxyManager
 from v2link_client.core.process_manager import (
     XrayProcessManager,
     ensure_port_available,
@@ -77,6 +82,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("v2link-client")
         self.resize(900, 640)
 
+        self._setup_menu()
+
         self._theme: ThemeName = "dark"
 
         central = QWidget(self)
@@ -89,6 +96,11 @@ class MainWindow(QMainWindow):
         self.validate_button = QPushButton("Validate & Save")
         self.validate_button.clicked.connect(self._on_validate_clicked)
         self.validate_button.setProperty("variant", "primary")
+
+        self.system_proxy_checkbox = QCheckBox("System Proxy")
+        self.system_proxy_checkbox.setToolTip(
+            "Apply system proxy settings while running so most apps use the tunnel automatically."
+        )
 
         self.start_stop_button = QPushButton("Start")
         self.start_stop_button.setEnabled(False)
@@ -123,6 +135,7 @@ class MainWindow(QMainWindow):
         top_row.setSpacing(10)
         top_row.addWidget(self.link_input, 1)
         top_row.addWidget(self.validate_button)
+        top_row.addWidget(self.system_proxy_checkbox)
         top_row.addWidget(self.theme_selector)
 
         control_row = QHBoxLayout()
@@ -176,6 +189,14 @@ class MainWindow(QMainWindow):
         )
         self._thread_pool = QThreadPool.globalInstance()
 
+        self._system_proxy = SystemProxyManager()
+        self._system_proxy_applied = False
+        if not self._system_proxy.is_supported():
+            self.system_proxy_checkbox.setEnabled(False)
+            self.system_proxy_checkbox.setToolTip(
+                "System proxy auto-apply is not supported on this desktop yet. Use manual proxy settings."
+            )
+
         self._health_timer = QTimer(self)
         self._health_timer.setInterval(HEALTH_INTERVAL_MS)
         self._health_timer.timeout.connect(self._kick_health_check)
@@ -200,6 +221,29 @@ class MainWindow(QMainWindow):
         self._apply_theme(self._theme, persist=False)
         self.theme_selector.currentTextChanged.connect(self._on_theme_changed)
 
+        # If the app previously applied system proxy and crashed, attempt to restore.
+        try:
+            if self._system_proxy.restore_if_needed():
+                logger.info("Restored system proxy from previous session")
+        except Exception:
+            logger.exception("Failed to restore system proxy from previous session")
+
+    def _setup_menu(self) -> None:
+        help_menu = self.menuBar().addMenu("&Help")
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+
+    def _show_about(self) -> None:
+        text = (
+            "<b>v2link-client</b><br>"
+            f"Version: {__version__}<br>"
+            f"Author: {__author__}<br><br>"
+            "Linux desktop client for V2Ray-style links (VLESS) built with Python + PyQt6.<br>"
+            "Powered by Xray-core."
+        )
+        QMessageBox.about(self, "About v2link-client", text)
+
     def _on_validate_clicked(self) -> None:
         self.status_label.setText("STOPPED")
         self._validated_config_path = None
@@ -207,6 +251,7 @@ class MainWindow(QMainWindow):
         self.start_stop_button.setEnabled(False)
         self.ping_button.setEnabled(False)
         self.speed_test_button.setEnabled(False)
+        self.system_proxy_checkbox.setEnabled(self._system_proxy.is_supported())
         self._api_port = None
         self._core_started_at = None
         self._stats_token += 1
@@ -231,6 +276,7 @@ class MainWindow(QMainWindow):
                 profile = {}
             profile["link"] = raw_link
             profile["theme"] = self._theme
+            profile["apply_system_proxy"] = bool(self.system_proxy_checkbox.isChecked())
             save_json(profile_path, profile)
 
             xray = find_xray_binary()
@@ -293,6 +339,7 @@ class MainWindow(QMainWindow):
         self._refresh_style(self.start_stop_button)
         self.link_input.setEnabled(False)
         self.validate_button.setEnabled(False)
+        self.system_proxy_checkbox.setEnabled(False)
         self.ping_button.setEnabled(False)
         self.speed_test_button.setEnabled(True)
         self._core_started_at = time.monotonic()
@@ -308,6 +355,8 @@ class MainWindow(QMainWindow):
         self.diagnostics_widget.set_hint(
             f"Started Xray. SOCKS5 {DEFAULT_LISTEN}:{self._socks_port} / HTTP {DEFAULT_LISTEN}:{self._http_port}"
         )
+        if self.system_proxy_checkbox.isChecked():
+            self._apply_system_proxy()
         self._status_timer.start()
 
     def _poll_core_status(self) -> None:
@@ -324,12 +373,14 @@ class MainWindow(QMainWindow):
         self._refresh_style(self.start_stop_button)
         self.link_input.setEnabled(True)
         self.validate_button.setEnabled(True)
+        self.system_proxy_checkbox.setEnabled(self._system_proxy.is_supported())
         self.ping_button.setEnabled(True if self._validated_link is not None else False)
         self.speed_test_button.setEnabled(False)
         self._health_timer.stop()
         self._health_token += 1
         self._stats_token += 1
         self._set_health_state("offline", "Not running")
+        self._restore_system_proxy()
         self._core_started_at = None
         self._set_metrics_defaults()
 
@@ -355,9 +406,11 @@ class MainWindow(QMainWindow):
         self._refresh_style(self.start_stop_button)
         self.link_input.setEnabled(True)
         self.validate_button.setEnabled(True)
+        self.system_proxy_checkbox.setEnabled(self._system_proxy.is_supported())
         self.ping_button.setEnabled(True if self._validated_link is not None else False)
         self.speed_test_button.setEnabled(False)
         self._set_health_state("offline", "Not running")
+        self._restore_system_proxy()
         self._core_started_at = None
         self._set_metrics_defaults()
         self.diagnostics_widget.set_hint(user_message)
@@ -371,6 +424,9 @@ class MainWindow(QMainWindow):
                 self.link_input.setText(link)
             self._theme = normalize_theme(data.get("theme"))
             self.theme_selector.setCurrentText(theme_display_name(self._theme))
+            apply_system_proxy = data.get("apply_system_proxy")
+            if isinstance(apply_system_proxy, bool):
+                self.system_proxy_checkbox.setChecked(apply_system_proxy)
 
     def _on_theme_changed(self, value: str) -> None:
         self._apply_theme(normalize_theme(value), persist=True)
@@ -675,3 +731,43 @@ class MainWindow(QMainWindow):
         if self._process.is_running():
             self._stop_core(user_message="Stopped (app closed).")
         super().closeEvent(event)
+
+    def _apply_system_proxy(self) -> None:
+        if self._system_proxy_applied:
+            return
+        if not self._system_proxy.is_supported():
+            self.diagnostics_widget.set_hint(
+                "System proxy apply is not supported on this desktop yet. Use manual proxy settings."
+            )
+            return
+        try:
+            self._system_proxy.apply(
+                SystemProxyConfig(
+                    http_host=DEFAULT_LISTEN,
+                    http_port=int(self._http_port),
+                    socks_host=DEFAULT_LISTEN,
+                    socks_port=int(self._socks_port),
+                    bypass_hosts=["localhost", "127.0.0.0/8", "::1"],
+                )
+            )
+        except AppError as exc:
+            self.diagnostics_widget.set_hint(f"Started, but failed to apply system proxy: {exc.user_message}")
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("System proxy apply failed")
+            self.diagnostics_widget.set_hint(f"Started, but failed to apply system proxy: {exc}")
+            return
+
+        self._system_proxy_applied = True
+        self.diagnostics_widget.set_hint(
+            f"System proxy applied. Most apps should now use {DEFAULT_LISTEN}:{self._http_port} automatically."
+        )
+
+    def _restore_system_proxy(self) -> None:
+        if not self._system_proxy_applied and not self._system_proxy.snapshot_path.exists():
+            return
+        try:
+            self._system_proxy.restore()
+        except Exception:
+            logger.exception("System proxy restore failed")
+        self._system_proxy_applied = False
